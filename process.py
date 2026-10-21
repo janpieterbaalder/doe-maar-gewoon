@@ -122,7 +122,9 @@ def repair_edges(page, spine):
         else:
             strip = (Ls[:, :probe + 3] if e == 'left' else Ls[:, ::-1][:, :probe + 3]).T
         ref = cv2.blur(strip[probe:probe + 3].mean(0, keepdims=True), (31, 1))   # papier iets naar binnen
-        dark = ((strip[:probe] < 0.9 * ref) & (ref > 150)).astype(np.uint8)
+        # licht papier: ook lichte lijnen tellen; gekleurd papier (rood/paars vel): alleen echt donker (graniet)
+        st = strip[:probe]
+        dark = (((st < 0.9 * ref) & (ref > 150)) | ((st < 0.55 * ref) & (ref > 90))).astype(np.uint8)
         dark[band:] = 0
         # schuine lijnen aaneensluiten, dan alleen houden wat over een flink stuk langs de rand loopt
         dark = cv2.dilate(dark, np.ones((2 * near + 1, 1), np.uint8))
