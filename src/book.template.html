@@ -52,8 +52,10 @@ body {
 .app > footer { grid-row: 3; }
 
 header, footer { position: relative; z-index: 3; padding-left: var(--gutter-l); padding-right: var(--gutter-r); }
-/* snel twee keer tikken (iPad/iPhone) mag niet de hele pagina inzoomen */
-header, footer, button, .toc { touch-action: manipulation; }
+/* Inzoomen doet het boek zelf (knijpen, dubbeltikken, slepen). De browser mag de hele pagina
+   niet inzoomen: die zoom is boven het boek niet terug te draaien. */
+header, footer, .reader .top, .reader .step { touch-action: none; }
+.toc { touch-action: pan-y; }
 header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding-block: 16px 4px; }
 .label {
   font-family: var(--font-label); font-weight: 700; font-size: 13px; letter-spacing: .3em;
@@ -67,6 +69,11 @@ header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding
   overflow-x: hidden; overflow-x: clip; overflow-y: visible;
   touch-action: none; user-select: none; -webkit-user-select: none;
 }
+/* ingezoomd: de laag met het boek schaalt en schuift; alles buiten het venster valt weg */
+.viewport.zoomed { overflow: hidden; cursor: grab; }
+.viewport.zoomed .page { cursor: inherit; }
+.viewport.panning { cursor: grabbing; }
+.zoomer { position: absolute; inset: 0; transform-origin: 0 0; }
 .shift { position: absolute; left: 50%; top: 50%; }
 .book { position: absolute; inset: 0; transform-style: preserve-3d; }
 
@@ -167,11 +174,12 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
 }
 .reader .pgname { flex: 1; min-width: 0; text-align: center; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .reader .pgname .chap { font-family: var(--font-ui); color: var(--muted); margin-left: 8px; }
-.reader .scroller { overflow: auto; overscroll-behavior: contain; touch-action: pan-x pan-y pinch-zoom; }
-.reader .sheet { box-sizing: border-box; min-width: 100%; width: max-content; padding: 8px var(--gutter-r) 96px var(--gutter-l); }
+.reader .stage { position: relative; overflow: hidden; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+.reader .stage.panning { cursor: grabbing; }
+.reader .layer { position: absolute; left: 0; top: 0; width: 100%; height: 100%; transform-origin: 0 0; }
 .reader img {
-  display: block; margin-inline: auto; height: auto; background: var(--paper); aspect-ratio: 1545 / 1600;
-  box-shadow: 0 10px 30px -12px rgba(var(--shadow-rgb), .45);
+  position: absolute; display: block; height: auto; background: var(--paper); aspect-ratio: 1545 / 1600;
+  box-shadow: 0 10px 30px -12px rgba(var(--shadow-rgb), .45); -webkit-user-drag: none; pointer-events: none;
 }
 .reader .step {
   position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); width: 48px; height: 48px;
@@ -201,6 +209,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   </header>
 
   <div class="viewport" id="vp" role="region" aria-label="Boek">
+    <div class="zoomer" id="zoomer">
     <div class="shift" id="shift">
       <div class="book" id="book">
         <div class="page left" id="pageL" hidden><div class="cast" id="castL"></div></div>
@@ -208,6 +217,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
         <div class="rotor" id="rotor" hidden></div>
       </div>
       <svg class="binding" id="binding" aria-hidden="true"></svg>
+    </div>
     </div>
   </div>
 
@@ -240,7 +250,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     <button id="rOut" aria-label="Uitzoomen"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5M8 10.5h5"/></svg></button>
     <button id="rIn" aria-label="Inzoomen"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5M8 10.5h5M10.5 8v5"/></svg></button>
   </div>
-  <div class="scroller" id="rScroll"><div class="sheet"><img id="rImg" alt="" width="1545" height="1600"></div></div>
+  <div class="stage" id="rStage"><div class="layer" id="rLayer"><img id="rImg" alt="" width="1545" height="1600" draggable="false"></div></div>
   <button class="step prev" id="rPrev" aria-label="Vorige pagina"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
   <button class="step next" id="rNext" aria-label="Volgende pagina"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
 </div>
@@ -281,6 +291,49 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   let pw = 0, ph = 0, gap = 0, Dp = 1000;
   let shiftNow = 0, slide = null, turn = null, drag = null, raf = 0, lastT = 0;
   const queue = [];
+  const coarse = matchMedia('(pointer: coarse)');
+  const DOUBLE_MS = 300, DOUBLE_PX = 40;     // dubbeltik: tijd en afstand tussen de twee tikken
+
+  // ---------- zoomen en schuiven (boek en leesweergave) ----------
+  // Een laag die schaalt vanaf (0,0) en verschuift. getRect geeft (bij zoom 1, in coördinaten van
+  // het venster) het deel dat in beeld moet blijven; kleiner dan het venster = gecentreerd.
+  function makeZoom(host, layer, getRect, maxZ, onChange) {
+    const zm = { z: 1, x: 0, y: 0, anim: 0 };
+    zm.apply = () => {
+      layer.style.transform = (zm.z === 1 && zm.x === 0 && zm.y === 0) ? ''
+        : `translate(${zm.x.toFixed(2)}px, ${zm.y.toFixed(2)}px) scale(${zm.z.toFixed(4)})`;
+      if (onChange) onChange(zm);
+    };
+    zm.fit = (z, x, y) => {
+      const r = getRect(), W = host.clientWidth, H = host.clientHeight;
+      const lim = (lo, hi, size, v) => (hi - lo) * z <= size ? (size - (lo + hi) * z) / 2 : clamp(v, size - hi * z, -lo * z);
+      return [lim(r.l, r.r, W, x), lim(r.t, r.b, H, y)];
+    };
+    zm.set = (z, x, y) => {
+      cancelAnimationFrame(zm.anim); zm.anim = 0;
+      z = clamp(z, 1, maxZ); [x, y] = zm.fit(z, x, y);
+      if (z === 1 && Math.abs(x) < 0.5 && Math.abs(y) < 0.5 && host === vp) x = y = 0;
+      zm.z = z; zm.x = x; zm.y = y; zm.apply();
+    };
+    // zoom z waarbij het punt (px, py) van het venster op zijn plek blijft
+    zm.around = (z, px, py) => [z, px - (px - zm.x) / zm.z * z, py - (py - zm.y) / zm.z * z];
+    zm.animate = (z, x, y, ms) => {
+      cancelAnimationFrame(zm.anim);
+      z = clamp(z, 1, maxZ); [x, y] = zm.fit(z, x, y);
+      const f = { z: zm.z, x: zm.x, y: zm.y }, t0 = performance.now(), dur = reduceMQ.matches ? 0 : (ms || 280);
+      const step = (now) => {
+        const k = dur ? clamp((now - t0) / dur, 0, 1) : 1, e = ease(k);
+        zm.z = f.z + (z - f.z) * e; zm.x = f.x + (x - f.x) * e; zm.y = f.y + (y - f.y) * e;
+        if (k >= 1) { zm.z = z; zm.x = x; zm.y = y; }
+        zm.apply();
+        zm.anim = k < 1 ? requestAnimationFrame(step) : 0;
+      };
+      zm.anim = requestAnimationFrame(step);
+    };
+    zm.reset = (animated) => { if (animated) zm.animate(1, 0, 0); else zm.set(1, 0, 0); };
+    zm.zoomed = () => zm.z > 1.01;
+    return zm;
+  }
 
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const url = (i) => `url("${PAGES[i]}")`;
@@ -346,8 +399,10 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   book.style.setProperty('--holes-l', holesSVG('l'));
 
   // ---------- maatvoering ----------
+  let lastLayoutW = 0;
   function layout() {
     const W = vp.clientWidth, H = vp.clientHeight;
+    if (W !== lastLayoutW) { lastLayoutW = W; bz.reset(false); }   // gedraaid of breder/smaller: zoom terug
     const compact = matchMedia('(max-height: 520px) and (orientation: landscape)').matches;
     single = W / H < 1.05 || W < 520;
     const availW = W - 32, availH = H * (compact ? 0.94 : 0.86);
@@ -364,6 +419,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     document.documentElement.style.setProperty('--foot-h', $('foot').offsetHeight + 'px');
     drawBinding();
     if (turn) applyTurn(); else showSpread();
+    if (bz.zoomed()) bz.set(bz.z, bz.x, bz.y);   // binnen het boek houden
   }
 
   // ---------- spiraal ----------
@@ -403,10 +459,22 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   }
 
   // ---------- statische pagina's ----------
+  // Ingezoomd tonen de open pagina's de scherpe versie (eerst laden, dan wisselen: geen leeg vlak).
+  let hdMode = false;
+  const loadedHD = new Set();
   function setPage(el, idx) {
-    if (idx < 0 || idx >= PAGES.length) { el.hidden = true; return; }
-    el.hidden = false;
+    if (idx < 0 || idx >= PAGES.length) { el.hidden = true; el.dataset.idx = ''; return; }
+    el.hidden = false; el.dataset.idx = idx;
+    const hd = hdMode && HD[idx];
+    if (!hd || loadedHD.has(hd)) { el.style.setProperty('--img', `url("${hd || PAGES[idx]}")`); return; }
     el.style.setProperty('--img', url(idx));
+    const im = new Image();
+    im.onload = () => { loadedHD.add(hd); if (hdMode && el.dataset.idx === String(idx)) el.style.setProperty('--img', `url("${hd}")`); };
+    im.src = hd;
+  }
+  function setHD(on) {
+    hdMode = on;
+    for (const el of [pageL, pageR]) if (!el.hidden && el.dataset.idx !== '') setPage(el, +el.dataset.idx);
   }
   function stacks(nL, nR) {
     const e = Math.max(0.6, pw / 1000);
@@ -611,6 +679,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   }
 
   function go(dir, fast) {
+    if (bz.zoomed()) bz.reset(true);
     if (turn || slide) { if (queue.length < 4) queue.push(dir); return; }
     if (single) {
       if (dir > 0 && focus === 'left' && s < LAST) return slideTo('right');
@@ -622,6 +691,7 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
 
   // Spring naar een spread; in enkelpagina-weergave ook naar de juiste kant.
   function jumpTo(sp, foc) {
+    if (bz.zoomed()) bz.reset(true);
     sp = clamp(sp, 0, LAST);
     if (!foc) foc = sp === 0 ? 'right' : sp === LAST ? 'left' : (sp > s ? 'left' : 'right');
     if (sp === 0) foc = 'right';
@@ -633,10 +703,78 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     if (t) autoTo(t, dir > 0 ? 1 : 0, Math.abs(sp - s) > 1);
   }
 
-  // ---------- slepen, klikken, vegen ----------
+  // ---------- zoomen in het boek ----------
+  // Knijpen of dubbeltikken zoomt in; ingezoomd sleep je met één of twee vingers, dubbeltikken
+  // zoomt weer uit. Bladeren (knoppen, toetsen, inhoud) zet de zoom eerst terug.
+  const zoomer = $('zoomer');
+  function bookRect() {
+    const W = vp.clientWidth, H = vp.clientHeight, cx = W / 2 + shiftNow, m = 8;
+    let l = Infinity, r = -Infinity;
+    if (!pageL.hidden && (!single || focus === 'left')) { l = Math.min(l, cx - gap / 2 - pw); r = Math.max(r, cx - gap / 2); }
+    if (!pageR.hidden && (!single || focus === 'right')) { l = Math.min(l, cx + gap / 2); r = Math.max(r, cx + gap / 2 + pw); }
+    if (!isFinite(l)) { l = 0; r = W; }
+    return { l: l - m, r: r + m, t: H / 2 - ph / 2 - m, b: H / 2 + ph / 2 + m };
+  }
+  const bz = makeZoom(vp, zoomer, bookRect, 4, (zm) => {
+    vp.classList.toggle('zoomed', zm.z > 1.01);
+    if (!hdMode && zm.z > 1.25) setHD(true);
+    else if (hdMode && zm.z <= 1.01) setHD(false);
+  });
+
+  const ptrs = new Map();            // vingers (of muis) die nu op het boek staan
+  let pinch = null, pan = null, gestureLock = false, tapTimer = 0, lastTap = null;
+  function local(e) { const r = vp.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+  function twoFingers() {
+    const [a, b] = [...ptrs.values()];
+    return { d: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  }
+  function toggleZoomAt(px, py) {
+    if (bz.zoomed()) { bz.reset(true); return; }
+    const [z, x, y] = bz.around(single ? 2.6 : 2.2, px, py);
+    bz.animate(z, x, y);
+  }
+  // Tik. Op een aanraakscherm wacht een enkele tik even of er een tweede volgt (dubbeltik = zoomen);
+  // met de muis gaat een klik direct door, behalve ingezoomd (dan zoomt dubbelklikken uit).
+  function tap(e, action) {
+    const [px, py] = local(e), now = performance.now();
+    const allowDouble = e.pointerType !== 'mouse' || bz.zoomed();
+    if (allowDouble && lastTap && now - lastTap.t < DOUBLE_MS && Math.hypot(px - lastTap.x, py - lastTap.y) < DOUBLE_PX) {
+      clearTimeout(tapTimer); lastTap = null; toggleZoomAt(px, py); return;
+    }
+    lastTap = allowDouble ? { t: now, x: px, y: py } : null;
+    clearTimeout(tapTimer);
+    if (!action) return;
+    if (!allowDouble) action();
+    else tapTimer = setTimeout(() => { lastTap = null; action(); }, DOUBLE_MS);
+  }
+
+  // ---------- slepen, klikken, vegen, knijpen ----------
   vp.addEventListener('pointerdown', (e) => {
-    if (e.button !== 0 || turn || slide) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
     closeToc();
+    const [lx, ly] = local(e);
+    ptrs.set(e.pointerId, { x: lx, y: ly });
+    try { vp.setPointerCapture(e.pointerId); } catch (err) { /* zonder capture werkt het binnen het boek nog steeds */ }
+    if (ptrs.size === 2) {
+      // tweede vinger: knijpen. Een begonnen omslag gaat terug.
+      clearTimeout(tapTimer); lastTap = null;
+      if (drag) {
+        if (drag.started && turn && turn.mode === 'drag') autoTo(turn, turn.dir > 0 ? 0 : 1);
+        drag = null; vp.classList.remove('dragging');
+      }
+      if (pan) { pan = null; vp.classList.remove('panning'); }
+      if (turn || slide) { gestureLock = true; return; }
+      const g = twoFingers();
+      pinch = { d0: Math.max(g.d, 1), mx: g.mx, my: g.my, z0: bz.z, x0: bz.x, y0: bz.y };
+      return;
+    }
+    if (ptrs.size > 2 || gestureLock) return;
+    if (bz.zoomed()) {
+      pan = { id: e.pointerId, sx: lx, sy: ly, x0: bz.x, y0: bz.y, moved: false };
+      vp.classList.add('panning');
+      return;
+    }
+    if (turn || slide) return;
     const rect = vp.getBoundingClientRect();
     const axisX = rect.left + rect.width / 2 + shiftNow;
     const x = e.clientX - axisX, y = e.clientY - (rect.top + rect.height / 2);
@@ -647,10 +785,25 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     if (!side) return;
     drag = { id: e.pointerId, x0: e.clientX, axisX, side, u0: Math.max(Math.abs(x), pw * 0.35),
              started: false, px: e.clientX, pt: performance.now(), vx: 0, pageX: x - side * (gap / 2 + pw / 2) };
-    try { vp.setPointerCapture(e.pointerId); } catch (err) { /* zonder capture werkt slepen binnen het boek nog steeds */ }
   });
 
   vp.addEventListener('pointermove', (e) => {
+    if (ptrs.has(e.pointerId)) { const [lx, ly] = local(e); ptrs.set(e.pointerId, { x: lx, y: ly }); }
+    if (pinch) {
+      if (ptrs.size < 2) return;
+      const g = twoFingers();
+      const z = clamp(pinch.z0 * g.d / pinch.d0, 1, 4);
+      // het punt onder het midden van de vingers blijft eronder: zo schuif je ook met twee vingers
+      const cx = (pinch.mx - pinch.x0) / pinch.z0, cy = (pinch.my - pinch.y0) / pinch.z0;
+      bz.set(z, g.mx - cx * z, g.my - cy * z);
+      return;
+    }
+    if (pan && e.pointerId === pan.id) {
+      const [lx, ly] = local(e);
+      if (Math.hypot(lx - pan.sx, ly - pan.sy) > 6) pan.moved = true;
+      bz.set(bz.z, pan.x0 + lx - pan.sx, pan.y0 + ly - pan.sy);
+      return;
+    }
     if (!drag || e.pointerId !== drag.id) return;
     const now = performance.now(), dx = e.clientX - drag.x0;
     drag.vx = 0.7 * drag.vx + 0.3 * ((e.clientX - drag.px) / Math.max(1, now - drag.pt));
@@ -674,8 +827,9 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     vp.classList.remove('dragging');
     if (!d.started) {
       if (cancelled) return;
-      // klik: in enkelpagina-weergave telt de helft van de pagina, anders de pagina zelf
-      go(single ? (d.pageX >= 0 ? 1 : -1) : d.side);
+      // tik: in enkelpagina-weergave telt de helft van de pagina, anders de pagina zelf
+      const dir = single ? (d.pageX >= 0 ? 1 : -1) : d.side;
+      tap(e, () => go(dir));
       return;
     }
     if (d.swipe) { if (!cancelled) go(e.clientX < d.x0 ? 1 : -1); return; }
@@ -685,9 +839,35 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     const complete = !cancelled && (v > 0.35 || (q > 0.5 && v > -0.35));
     autoTo(t, complete ? (t.dir > 0 ? 1 : 0) : (t.dir > 0 ? 0 : 1));
   }
-  vp.addEventListener('pointerup', (e) => endDrag(e, false));
-  vp.addEventListener('pointercancel', (e) => endDrag(e, true));
+  function pointerEnd(e, cancelled) {
+    ptrs.delete(e.pointerId);
+    if (pinch) {
+      if (ptrs.size < 2) { pinch = null; gestureLock = ptrs.size > 0; if (bz.z < 1.08) bz.reset(true); }
+      return;
+    }
+    if (gestureLock) { if (!ptrs.size) gestureLock = false; return; }
+    if (pan && e.pointerId === pan.id) {
+      const p = pan; pan = null; vp.classList.remove('panning');
+      if (!p.moved && !cancelled) tap(e, null);
+      return;
+    }
+    endDrag(e, cancelled);
+  }
+  vp.addEventListener('pointerup', (e) => pointerEnd(e, false));
+  vp.addEventListener('pointercancel', (e) => pointerEnd(e, true));
   vp.addEventListener('dblclick', (e) => { e.preventDefault(); });
+  // touchpad-knijpen (komt binnen als ctrl+scroll) zoomt; ingezoomd schuift scrollen het beeld
+  vp.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !bz.zoomed()) return;
+    e.preventDefault();
+    const [px, py] = local(e);
+    if (e.ctrlKey) {
+      const [z, x, y] = bz.around(clamp(bz.z * Math.exp(-e.deltaY * 0.01), 1, 4), px, py);
+      if (z <= 1.02) bz.reset(false); else bz.set(z, x, y);
+    } else bz.set(bz.z, bz.x - e.deltaX, bz.y - e.deltaY);
+  }, { passive: false });
+  // Safari: eigen knijpgebaren van de browser uitzetten (die zouden de hele pagina vergroten)
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
 
   btnPrev.addEventListener('click', () => go(-1));
   btnNext.addEventListener('click', () => go(1));
@@ -770,23 +950,24 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   document.addEventListener('pointerdown', (e) => { if (!toc.hidden && !toc.contains(e.target) && e.target !== tocBtn && !tocBtn.contains(e.target)) closeToc(); });
 
   // ---------- leesweergave ----------
-  const reader = $('reader'), rImg = $('rImg'), rScroll = $('rScroll'), rName = $('rName');
-  const ZOOMS = [1, 1.5, 2, 3];
-  let rIdx = 0, rZoom = 0, rKeyboard = false;
-  function fitWidth() {
-    const W = rScroll.clientWidth - 32;
-    return Math.max(200, Math.min(W, 1100));
+  // De pagina past in de breedte; knijpen, dubbeltikken en de knoppen zoomen, slepen schuift,
+  // vegen (niet ingezoomd) gaat naar de vorige of volgende pagina.
+  const reader = $('reader'), rImg = $('rImg'), rStage = $('rStage'), rLayer = $('rLayer'), rName = $('rName');
+  const ZSTEPS = [1, 1.6, 2.5, 4];
+  let rIdx = 0, rKeyboard = false, rBox = { l: 0, t: 8, w: 300, h: 310 };
+  function readerLayout() {
+    const W = rStage.clientWidth;
+    const w = Math.max(200, Math.min(W - 32, 1100));
+    rBox = { l: (W - w) / 2, t: 8, w, h: w / ASPECT };
+    Object.assign(rImg.style, { left: rBox.l + 'px', top: rBox.t + 'px', width: w + 'px' });
   }
-  function setZoom(z, cx, cy) {
-    // inzoomen rond een punt (standaard het midden van het beeld)
-    const sw = rScroll.scrollWidth, sh = rScroll.scrollHeight;
-    const px = cx !== undefined ? cx : rScroll.clientWidth / 2, py = cy !== undefined ? cy : rScroll.clientHeight / 2;
-    const fx = (rScroll.scrollLeft + px) / sw, fy = (rScroll.scrollTop + py) / sh;
-    rZoom = clamp(z, 0, ZOOMS.length - 1);
-    rImg.style.width = Math.round(fitWidth() * ZOOMS[rZoom]) + 'px';
-    rScroll.scrollLeft = fx * rScroll.scrollWidth - px;
-    rScroll.scrollTop = fy * rScroll.scrollHeight - py;
-    $('rOut').disabled = rZoom === 0; $('rIn').disabled = rZoom === ZOOMS.length - 1;
+  const rz = makeZoom(rStage, rLayer,
+    () => ({ l: rBox.l - 12, r: rBox.l + rBox.w + 12, t: 0, b: rBox.t + rBox.h + 88 }), 4,
+    (zm) => { $('rOut').disabled = zm.z <= 1.01; $('rIn').disabled = zm.z >= 3.99; });
+  function stepZoom(dir) {
+    const next = dir > 0 ? (ZSTEPS.find((v) => v > rz.z + 0.01) || 4) : ([...ZSTEPS].reverse().find((v) => v < rz.z - 0.01) || 1);
+    const [z, x, y] = rz.around(next, rStage.clientWidth / 2, rStage.clientHeight / 2);
+    rz.animate(z, x, y);
   }
   function showReaderPage(i) {
     rIdx = clamp(i, 0, PAGES.length - 1);
@@ -797,16 +978,16 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     const b = document.createElement('span'); b.className = 'chap'; b.textContent = chapterAt(rIdx).title;
     rName.append(a, b);
     $('rPrev').disabled = rIdx === 0; $('rNext').disabled = rIdx === PAGES.length - 1;
-    rScroll.scrollTop = 0; rScroll.scrollLeft = (rScroll.scrollWidth - rScroll.clientWidth) / 2;
+    rz.set(1, 0, 0);
     const nb = new Image(); nb.src = HD[rIdx + 1] || PAGES[rIdx + 1] || '';
   }
   function openReader(e) {
     closeToc();
+    if (bz.zoomed()) bz.reset(false);
     const i = single ? visibleIdx() : (s === 0 ? 0 : s === LAST ? PAGES.length - 1 : s === 1 ? 2 : 2 * s - 1);
     reader.hidden = false;
-    rZoom = matchMedia('(max-width: 700px)').matches ? 1 : 0;
+    readerLayout();
     showReaderPage(i);
-    setZoom(rZoom);
     rKeyboard = !!(e && e.detail === 0);
     if (rKeyboard) $('rClose').focus();   // alleen bij bediening met het toetsenbord
   }
@@ -825,14 +1006,79 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
   }
   $('readBtn').addEventListener('click', openReader);
   $('rClose').addEventListener('click', closeReader);
-  $('rIn').addEventListener('click', () => setZoom(rZoom + 1));
-  $('rOut').addEventListener('click', () => setZoom(rZoom - 1));
+  $('rIn').addEventListener('click', () => stepZoom(1));
+  $('rOut').addEventListener('click', () => stepZoom(-1));
   $('rPrev').addEventListener('click', () => showReaderPage(rIdx - 1));
   $('rNext').addEventListener('click', () => showReaderPage(rIdx + 1));
-  rImg.addEventListener('dblclick', (e) => {
-    const r = rScroll.getBoundingClientRect();
-    setZoom(rZoom === 0 ? 2 : 0, e.clientX - r.left, e.clientY - r.top);
+
+  const rPtrs = new Map();
+  let rPinch = null, rPan = null, rLock = false, rLastTap = null;
+  function rLocal(e) { const r = rStage.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+  rStage.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    const [px, py] = rLocal(e);
+    rPtrs.set(e.pointerId, { x: px, y: py });
+    try { rStage.setPointerCapture(e.pointerId); } catch (err) { /* niet nodig */ }
+    if (rPtrs.size === 2) {
+      if (rPan) { rPan = null; rStage.classList.remove('panning'); }
+      rLastTap = null;
+      const [a, b] = [...rPtrs.values()];
+      rPinch = { d0: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, z0: rz.z, x0: rz.x, y0: rz.y };
+      return;
+    }
+    if (rPtrs.size > 2 || rLock) return;
+    rPan = { id: e.pointerId, sx: px, sy: py, x0: rz.x, y0: rz.y, moved: false, t0: performance.now() };
+    rStage.classList.add('panning');
   });
+  rStage.addEventListener('pointermove', (e) => {
+    if (!rPtrs.has(e.pointerId)) return;
+    const [px, py] = rLocal(e);
+    rPtrs.set(e.pointerId, { x: px, y: py });
+    if (rPinch) {
+      if (rPtrs.size < 2) return;
+      const [a, b] = [...rPtrs.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      const z = clamp(rPinch.z0 * d / rPinch.d0, 1, 4);
+      const cx = (rPinch.mx - rPinch.x0) / rPinch.z0, cy = (rPinch.my - rPinch.y0) / rPinch.z0;
+      rz.set(z, mx - cx * z, my - cy * z);
+      return;
+    }
+    if (rPan && e.pointerId === rPan.id) {
+      if (Math.hypot(px - rPan.sx, py - rPan.sy) > 6) rPan.moved = true;
+      rz.set(rz.z, rPan.x0 + px - rPan.sx, rPan.y0 + py - rPan.sy);
+    }
+  });
+  function rEnd(e, cancelled) {
+    rPtrs.delete(e.pointerId);
+    if (rPinch) { if (rPtrs.size < 2) { rPinch = null; rLock = rPtrs.size > 0; } return; }
+    if (rLock) { if (!rPtrs.size) rLock = false; return; }
+    if (!rPan || e.pointerId !== rPan.id) return;
+    const p = rPan; rPan = null; rStage.classList.remove('panning');
+    if (cancelled) return;
+    const [px, py] = rLocal(e), dx = px - p.sx, dy = py - p.sy;
+    // vegen op ware grootte: volgende of vorige pagina
+    if (rz.z <= 1.01 && Math.abs(dx) > 60 && Math.abs(dx) > 1.5 * Math.abs(dy) && performance.now() - p.t0 < 700) {
+      showReaderPage(rIdx + (dx < 0 ? 1 : -1)); return;
+    }
+    if (p.moved) return;
+    const now = performance.now();
+    if (rLastTap && now - rLastTap.t < DOUBLE_MS && Math.hypot(px - rLastTap.x, py - rLastTap.y) < DOUBLE_PX) {
+      rLastTap = null;
+      const [z, x, y] = rz.around(rz.z > 1.01 ? 1 : 2.5, px, py);
+      rz.animate(z, x, y);
+      return;
+    }
+    rLastTap = { t: now, x: px, y: py };
+  }
+  rStage.addEventListener('pointerup', (e) => rEnd(e, false));
+  rStage.addEventListener('pointercancel', (e) => rEnd(e, true));
+  rStage.addEventListener('dblclick', (e) => e.preventDefault());
+  rStage.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const [px, py] = rLocal(e);
+    if (e.ctrlKey) { const [z, x, y] = rz.around(clamp(rz.z * Math.exp(-e.deltaY * 0.01), 1, 4), px, py); rz.set(z, x, y); }
+    else rz.set(rz.z, rz.x - e.deltaX, rz.y - e.deltaY);
+  }, { passive: false });
 
   // ---------- volledig scherm ----------
   const fsBtn = $('fsBtn');
@@ -848,8 +1094,10 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
       if (e.key === 'Escape') { rKeyboard = true; closeReader(); }
       else if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); showReaderPage(rIdx + 1); }
       else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); showReaderPage(rIdx - 1); }
-      else if (e.key === '+' || e.key === '=') setZoom(rZoom + 1);
-      else if (e.key === '-') setZoom(rZoom - 1);
+      else if (e.key === '+' || e.key === '=') stepZoom(1);
+      else if (e.key === '-') stepZoom(-1);
+      else if (e.key === 'ArrowDown') { e.preventDefault(); rz.set(rz.z, rz.x, rz.y - 80); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); rz.set(rz.z, rz.x, rz.y + 80); }
       return;
     }
     if (!toc.hidden && e.key === 'Escape') { closeToc(); tocBtn.focus(); return; }
@@ -860,7 +1108,8 @@ button svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke
     else if (e.key === 'End') { e.preventDefault(); jumpTo(LAST); }
   });
 
-  new ResizeObserver(() => { layout(); if (!reader.hidden) setZoom(rZoom); }).observe(vp);
+  new ResizeObserver(() => { layout(); if (!reader.hidden) { readerLayout(); rz.set(rz.z, rz.x, rz.y); } }).observe(vp);
+  if (coarse.matches) chapEl.textContent = 'Veeg om te bladeren, dubbeltik om in te zoomen';
   layout();
 })();
 </script>
