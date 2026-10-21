@@ -1,0 +1,9 @@
+# tussenresultaten en controles
+vergelijk/
+artifact/
+__pycache__/
+*.log
+quads_refined.backup.json
+.playwright-mcp/
+web/test.html
+.vercel
