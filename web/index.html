@@ -75,6 +75,8 @@ body {
 .app > footer { grid-row: 3; }
 
 header, footer { position: relative; z-index: 3; padding-left: var(--gutter-l); padding-right: var(--gutter-r); }
+/* snel twee keer tikken (iPad/iPhone) mag niet de hele pagina inzoomen */
+header, footer, button, .toc { touch-action: manipulation; }
 header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding-block: 16px 4px; }
 .label {
   font-family: var(--font-label); font-weight: 700; font-size: 13px; letter-spacing: .3em;
